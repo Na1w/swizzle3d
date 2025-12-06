@@ -25,25 +25,6 @@ struct Varyings {
     uv: Vec2,
 }
 
-struct Framebuffer {
-    color: Vec<u32>,
-    depth: Vec<f32>, // z-buffer in NDC [-1,1], lower is nearer after mapping
-    w: usize,
-    h: usize,
-}
-
-impl Framebuffer {
-    fn new(w: usize, h: usize) -> Self {
-        Self { color: vec![0x000000; w * h], depth: vec![f32::INFINITY; w * h], w, h }
-    }
-    fn clear(&mut self, rgba: u32) {
-        self.color.fill(rgba);
-        self.depth.fill(f32::INFINITY);
-    }
-    #[inline]
-    fn idx(&self, x: i32, y: i32) -> usize { (y as usize) * self.w + (x as usize) }
-}
-
 fn checkerboard(uv: Vec2) -> Vec3 {
     // Simple, tile 8x8 checker
     let scale = 8.0;
@@ -54,6 +35,127 @@ fn checkerboard(uv: Vec2) -> Vec3 {
     let a = vec3(0.12, 0.12, 0.12);
     let b = vec3(0.85, 0.85, 0.85);
     a * (1.0 - c) + b * c
+}
+
+// --- Procedural materials ---
+#[derive(Clone, Copy)]
+enum Material { Checker, Starfield, Fire }
+
+// Note: Materials are bound per triangle (see tri_materials in worker loop).
+
+#[inline]
+fn hash2(x: Vec2) -> f32 {
+    // Low-cost hash based on dot + sin, returns [0,1)
+    let p = x;
+    let h = (p.x * 127.1 + p.y * 311.7).sin() * 43758.5453;
+    h.fract().abs()
+}
+
+#[inline]
+fn value_noise(p: Vec2) -> f32 {
+    // 2D value noise using bilinear interpolation of hashed grid points
+    let i = vec2(p.x.floor(), p.y.floor());
+    let f = p - i;
+    let u = vec2(f.x * f.x * (3.0 - 2.0 * f.x), f.y * f.y * (3.0 - 2.0 * f.y));
+    let n00 = hash2(i);
+    let n10 = hash2(i + vec2(1.0, 0.0));
+    let n01 = hash2(i + vec2(0.0, 1.0));
+    let n11 = hash2(i + vec2(1.0, 1.0));
+    let nx0 = n00 + (n10 - n00) * u.x;
+    let nx1 = n01 + (n11 - n01) * u.x;
+    nx0 + (nx1 - nx0) * u.y
+}
+
+#[inline]
+fn fbm(mut p: Vec2, octaves: i32) -> f32 {
+    let mut a = 0.0;
+    let mut amp = 0.5;
+    for _ in 0..octaves {
+        a += value_noise(p) * amp;
+        p = p * 2.0 + vec2(3.1, 1.7);
+        amp *= 0.5;
+    }
+    a
+}
+
+#[inline]
+fn sample_starfield(uv: Vec2, time: f32) -> Vec3 {
+    // Tile space for stars
+    let scale = 40.0; // higher -> more potential stars
+    let p = uv * scale;
+    let cell = vec2(p.x.floor(), p.y.floor());
+    let r = hash2(cell);
+    let density = 0.975; // keep sparse
+    if r > density {
+        // brightness based on hash and a twinkle factor
+        let phase = hash2(cell + vec2(7.3, 9.2)) * 6.28318;
+        let twinkle = 0.6 + 0.4 * (time * 6.0 + phase).sin().abs();
+        let b = ((r - density) / (1.0 - density)).powf(4.0) * twinkle; // concentrate near 1
+        let color = vec3(0.8, 0.9, 1.0) * b; // slightly bluish white
+        return color.clamp(vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
+    }
+    // faint background
+    let bg = 0.02 + 0.03 * fbm(uv * 3.0 + vec2(0.0, time * 0.05), 3);
+    vec3(bg, bg, bg)
+}
+
+#[inline]
+fn fire_ramp(t: f32) -> Vec3 {
+    // t in [0,1]
+    let t = t.clamp(0.0, 1.0);
+    // piecewise: black->red->orange->yellow->white
+    if t < 0.3 {
+        // black to red
+        let k = t / 0.3;
+        vec3(0.0, 0.0, 0.0) * (1.0 - k) + vec3(1.0, 0.0, 0.0) * k
+    } else if t < 0.6 {
+        // red to orange
+        let k = (t - 0.3) / 0.3;
+        vec3(1.0, 0.0, 0.0) * (1.0 - k) + vec3(1.0, 0.5, 0.0) * k
+    } else if t < 0.85 {
+        // orange to yellow
+        let k = (t - 0.6) / 0.25;
+        vec3(1.0, 0.5, 0.0) * (1.0 - k) + vec3(1.0, 1.0, 0.0) * k
+    } else {
+        // yellow to white
+        let k = (t - 0.85) / 0.15;
+        vec3(1.0, 1.0, 0.0) * (1.0 - k) + vec3(1.0, 1.0, 1.0) * k
+    }
+}
+
+#[inline]
+fn sample_fire(uv: Vec2, time: f32) -> Vec3 {
+    // Flip Y so fire rises upward visually in [0,1] UV
+    let p = vec2(uv.x, 1.0 - uv.y);
+    // Horizontal turbulence and vertical advection
+    let speed = 0.6;
+    let scroll = time * speed;
+    let turbulence = fbm(vec2(p.x * 3.0, p.y * 6.0 + scroll * 4.0), 4);
+    // Base intensity increases near bottom and decreases toward top
+    let base = (1.2 * (1.0 - p.y) + 0.8 * turbulence).clamp(0.0, 1.0);
+    // Add flicker
+    let flicker = 0.85 + 0.15 * (time * 10.0 + hash2(vec2((p.x * 5.0).floor(), (p.y * 8.0).floor())) * 6.28318).sin().abs();
+    let t = (base.powf(1.2) * flicker).clamp(0.0, 1.0);
+    fire_ramp(t)
+}
+
+// Default per-face materials; order +X,-X,+Y,-Y,+Z,-Z
+const FACE_MATERIALS: [Material; 6] = [
+    Material::Fire,      // +X
+    Material::Checker,   // -X
+    Material::Checker,   // +Y
+    Material::Checker,   // -Y
+    Material::Starfield, // +Z
+    Material::Checker,   // -Z
+];
+
+#[inline]
+fn sample_material(uv: Vec2, material: Material, time: f32) -> Vec3 {
+    match material {
+        Material::Checker => checkerboard(uv),
+        Material::Starfield => sample_starfield(uv * 1.0, time),
+        Material::Fire => sample_fire(uv * 1.0, time),
+    }
 }
 
 fn lambert_shade(base_color: Vec3, normal_ws: Vec3, light_dir_ws: Vec3, view_dir_ws: Vec3) -> Vec3 {
@@ -143,53 +245,7 @@ fn edge(a: Vec3, b: Vec3, c: Vec3) -> f32 {
 #[inline]
 fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 { v.max(lo).min(hi) }
 
-fn draw_triangle(fb: &mut Framebuffer, v0: &Varyings, v1: &Varyings, v2: &Varyings, light_dir: Vec3, cam_pos: Vec3) {
-    let p0 = v0.screen; let p1 = v1.screen; let p2 = v2.screen;
-
-    // Backface culling in screen space
-    let area = edge(p0, p1, p2);
-    if area >= 0.0 { return; }
-
-    // Bounding box
-    let min_x = p0.x.min(p1.x).min(p2.x).floor().max(0.0) as i32;
-    let max_x = p0.x.max(p1.x).max(p2.x).ceil().min((fb.w - 1) as f32) as i32;
-    let min_y = p0.y.min(p1.y).min(p2.y).floor().max(0.0) as i32;
-    let max_y = p0.y.max(p1.y).max(p2.y).ceil().min((fb.h - 1) as f32) as i32;
-
-    let inv_area = 1.0 / area;
-
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let p = vec3(x as f32 + 0.5, y as f32 + 0.5, 0.0);
-            let w0 = edge(p1, p2, p) * inv_area;
-            let w1 = edge(p2, p0, p) * inv_area;
-            let w2 = edge(p0, p1, p) * inv_area;
-            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
-
-            // Perspective-correct weights
-            let invw = v0.inv_w * w0 + v1.inv_w * w1 + v2.inv_w * w2;
-            let recip = 1.0 / invw;
-
-            let ndc_z = (v0.screen.z * v0.inv_w * w0 + v1.screen.z * v1.inv_w * w1 + v2.screen.z * v2.inv_w * w2) * recip;
-            let z = ndc_depth_to_zbuf(ndc_z);
-            let idx = fb.idx(x, y);
-            if z >= fb.depth[idx] { continue; }
-
-            let uv = (v0.uv * v0.inv_w * w0 + v1.uv * v1.inv_w * w1 + v2.uv * v2.inv_w * w2) * recip;
-            let normal = (v0.normal * v0.inv_w * w0 + v1.normal * v1.inv_w * w1 + v2.normal * v2.inv_w * w2) * recip;
-            let world_pos = (v0.world_pos * v0.inv_w * w0 + v1.world_pos * v1.inv_w * w1 + v2.world_pos * v2.inv_w * w2) * recip;
-
-            let base = checkerboard(uv);
-            let view_dir = (cam_pos - world_pos).normalize();
-            let rgb = lambert_shade(base, normal, light_dir, view_dir).clamp(vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
-            let r = (rgb.x * 255.0) as u32;
-            let g = (rgb.y * 255.0) as u32;
-            let b = (rgb.z * 255.0) as u32;
-            fb.color[idx] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-            fb.depth[idx] = z;
-        }
-    }
-}
+// Removed legacy single-threaded raster path to avoid dead code warnings.
 
 // A band is a disjoint vertical range of rows [y0, y1) with exclusive access to its color/depth slices.
 struct Band<'a> {
@@ -199,7 +255,6 @@ struct Band<'a> {
     y0: i32,
     y1: i32,
     // debug visualization
-    id: usize,
     tint: u32,   // ARGB tint assigned to this band
     debug: bool, // whether to apply visualization
 }
@@ -239,7 +294,7 @@ fn blend_tint_argb(color: u32, tint: u32, t_num: u8, t_den: u8) -> u32 {
     ((a as u32) << 24) | (r << 16) | (g << 8) | b
 }
 
-fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyings, light_dir: Vec3, cam_pos: Vec3) {
+fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyings, light_dir: Vec3, cam_pos: Vec3, time: f32, material: Material) {
     let p0 = v0.screen; let p1 = v1.screen; let p2 = v2.screen;
 
     // Backface culling in screen space
@@ -278,7 +333,7 @@ fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyin
             let normal = (v0.normal * v0.inv_w * w0 + v1.normal * v1.inv_w * w1 + v2.normal * v2.inv_w * w2) * recip;
             let world_pos = (v0.world_pos * v0.inv_w * w0 + v1.world_pos * v1.inv_w * w1 + v2.world_pos * v2.inv_w * w2) * recip;
 
-            let base = checkerboard(uv);
+            let base = sample_material(uv, material, time);
             let view_dir = (cam_pos - world_pos).normalize();
             let rgb = lambert_shade(base, normal, light_dir, view_dir).clamp(vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
             let r = (rgb.x * 255.0) as u32;
@@ -320,8 +375,8 @@ async fn main() {
     let (from_worker_tx, mut from_worker_rx) = mpsc::channel::<Vec<u32>>(2);
     // Scene params (watch latest angle)
     #[derive(Clone, Copy)]
-    struct SceneParams { angle: f32, debug: bool }
-    let (scene_tx, scene_rx) = watch::channel(SceneParams { angle: 0.0, debug: false });
+    struct SceneParams { angle: f32, debug: bool, time: f32 }
+    let (scene_tx, scene_rx) = watch::channel(SceneParams { angle: 0.0, debug: false, time: 0.0 });
 
     // Preallocate double buffers and send to worker
     let buf_size = WIDTH * HEIGHT;
@@ -338,7 +393,34 @@ async fn main() {
         let target = target;
         let up = up;
         let light_dir = light_dir;
-        let mut scene_rx = scene_rx;
+        let scene_rx = scene_rx;
+
+        // Bind a material per triangle (fixed mapping to cube faces):
+        // Triangles are ordered in make_cube as:
+        // 0-1: front (+Z), 2-3: back (-Z), 4-5: top (+Y), 6-7: bottom (-Y), 8-9: right (+X), 10-11: left (-X)
+        let mut tri_materials: Vec<Material> = Vec::with_capacity(tris_w.len());
+        for (i, _) in tris_w.iter().enumerate() {
+            let mat = if i <= 1 {
+                // front +Z
+                FACE_MATERIALS[4]
+            } else if i <= 3 {
+                // back -Z
+                FACE_MATERIALS[5]
+            } else if i <= 5 {
+                // top +Y
+                FACE_MATERIALS[2]
+            } else if i <= 7 {
+                // bottom -Y
+                FACE_MATERIALS[3]
+            } else if i <= 9 {
+                // right +X
+                FACE_MATERIALS[0]
+            } else {
+                // left -X (10-11)
+                FACE_MATERIALS[1]
+            };
+            tri_materials.push(mat);
+        }
 
         while let Some(mut color) = to_worker_rx.recv().await {
             // Read latest scene params
@@ -421,7 +503,7 @@ async fn main() {
                 let y_start = y0 as i32;
                 let y_end = (y0 + rows) as i32;
                 let tint = tints[band_id % tints.len()];
-                bands.push(Band { color: c_chunk, depth: d_chunk, w: WIDTH, y0: y_start, y1: y_end, id: band_id, tint, debug });
+                bands.push(Band { color: c_chunk, depth: d_chunk, w: WIDTH, y0: y_start, y1: y_end, tint, debug });
                 y0 += rows;
                 band_id += 1;
             }
@@ -439,6 +521,7 @@ async fn main() {
                 tasks.push(BandTask { band, bin });
             }
 
+            let time = params.time;
             tasks.into_par_iter().for_each(|mut t|
             {
                 for &ti in &t.bin {
@@ -446,7 +529,8 @@ async fn main() {
                     let a = var[idxs[0] as usize];
                     let b = var[idxs[1] as usize];
                     let c = var[idxs[2] as usize];
-                    draw_triangle_band(&mut t.band, &a, &b, &c, light_dir, cam_pos);
+                    let material = tri_materials[ti];
+                    draw_triangle_band(&mut t.band, &a, &b, &c, light_dir, cam_pos, time, material);
                 }
             });
 
@@ -459,6 +543,7 @@ async fn main() {
 
     // Main loop: update params, present completed frames, recycle buffers
     let mut angle: f32 = 0.0;
+    let start_time = Instant::now();
     let mut debug: bool = false;
     let mut last_present = Instant::now();
     let mut fps_ema: f32 = 0.0;
@@ -469,7 +554,8 @@ async fn main() {
         }
 
         angle += 0.8 * (1.0 / 60.0);
-        let _ = scene_tx.send(SceneParams { angle, debug });
+        let time = start_time.elapsed().as_secs_f32();
+        let _ = scene_tx.send(SceneParams { angle, debug, time });
 
         if let Some(color) = from_worker_rx.try_recv().ok() {
             // Present
