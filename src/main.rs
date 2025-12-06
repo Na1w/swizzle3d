@@ -231,6 +231,41 @@ fn make_cube(size: f32) -> (Vec<Vertex>, Vec<[u32; 3]>) {
     (verts, idx)
 }
 
+// Generate a UV sphere with given rings (latitude) and segments (longitude)
+// Rings >= 2, Segments >= 3
+fn make_uv_sphere(rings: u32, segments: u32, radius: f32) -> (Vec<Vertex>, Vec<[u32; 3]>) {
+    let rings = rings.max(2);
+    let segments = segments.max(3);
+    let mut verts: Vec<Vertex> = Vec::with_capacity((rings as usize + 1) * (segments as usize + 1));
+    for r in 0..=rings {
+        let v = r as f32 / rings as f32; // [0,1]
+        let theta = v * std::f32::consts::PI; // 0..PI
+        let (st, ct) = theta.sin_cos();
+        for s in 0..=segments {
+            let u = s as f32 / segments as f32; // [0,1]
+            let phi = u * std::f32::consts::TAU; // 0..2PI
+            let (sp, cp) = phi.sin_cos();
+            let n = vec3(cp * st, ct, sp * st);
+            let pos = n * radius;
+            verts.push(Vertex { pos, normal: n, uv: vec2(u, 1.0 - v) });
+        }
+    }
+    let stride = (segments + 1) as usize;
+    let mut tris: Vec<[u32; 3]> = Vec::with_capacity((rings as usize) * (segments as usize) * 2);
+    for r in 0..rings {
+        for s in 0..segments {
+            let i0 = (r as usize) * stride + (s as usize);
+            let i1 = i0 + 1;
+            let i2 = i0 + stride;
+            let i3 = i2 + 1;
+            // two triangles per quad, winding to face outward (right-handed camera)
+            tris.push([i0 as u32, i2 as u32, i1 as u32]);
+            tris.push([i1 as u32, i2 as u32, i3 as u32]);
+        }
+    }
+    (verts, tris)
+}
+
 fn ndc_depth_to_zbuf(ndc_z: f32) -> f32 {
     // Map [-1,1] where -1 is near to a positive value; we'll use direct compare on depth with smaller closer.
     // We initialized depth with +inf so we compare real z later.
@@ -363,20 +398,32 @@ async fn main() {
     window.limit_update_rate(Some(std::time::Duration::from_micros(16_667))); // ~60 FPS
 
     let (verts, tris) = make_cube(1.6);
+    let (sphere_verts, sphere_tris) = make_uv_sphere(32, 48, 0.8);
 
     // Camera
-    let cam_pos = vec3(0.0, 0.0, 3.0);
-    let target = vec3(0.0, 0.0, 0.0);
     let up = vec3(0.0, 1.0, 0.0);
-    let light_dir = vec3(0.6, 0.7, 0.2).normalize();
 
     // Channels: free buffers -> worker, completed frames -> main
     let (to_worker_tx, mut to_worker_rx) = mpsc::channel::<Vec<u32>>(2);
     let (from_worker_tx, mut from_worker_rx) = mpsc::channel::<Vec<u32>>(2);
-    // Scene params (watch latest angle)
+    // Scene params (watch latest parameters)
     #[derive(Clone, Copy)]
-    struct SceneParams { angle: f32, debug: bool, time: f32 }
-    let (scene_tx, scene_rx) = watch::channel(SceneParams { angle: 0.0, debug: false, time: 0.0 });
+    struct SceneParams {
+        angle: f32,
+        debug: bool,
+        time: f32,
+        cam_pos: Vec3,
+        cam_target: Vec3,
+        light_dir: Vec3,
+    }
+    let (scene_tx, scene_rx) = watch::channel(SceneParams {
+        angle: 0.0,
+        debug: false,
+        time: 0.0,
+        cam_pos: vec3(0.0, 0.0, 3.0),
+        cam_target: vec3(0.0, 0.0, 0.0),
+        light_dir: vec3(0.6, 0.7, 0.2).normalize(),
+    });
 
     // Preallocate double buffers and send to worker
     let buf_size = WIDTH * HEIGHT;
@@ -386,13 +433,12 @@ async fn main() {
     // Spawn render worker (async task; heavy compute uses Rayon internally)
     let verts_w = verts.clone();
     let tris_w = tris.clone();
+    let sphere_verts_w = sphere_verts.clone();
+    let sphere_tris_w = sphere_tris.clone();
     tokio::spawn(async move {
         // Depth buffer reused inside worker
         let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
-        let cam_pos = cam_pos; // move into task
-        let target = target;
         let up = up;
-        let light_dir = light_dir;
         let scene_rx = scene_rx;
 
         // Bind a material per triangle (fixed mapping to cube faces):
@@ -433,12 +479,12 @@ async fn main() {
             // Compute transforms for this frame
             let angle = params.angle;
             let model = Mat4::from_rotation_y(angle) * Mat4::from_rotation_x(angle * 0.5);
-            let view = Mat4::look_at_rh(cam_pos, target, up);
+            let view = Mat4::look_at_rh(params.cam_pos, params.cam_target, up);
             let aspect = WIDTH as f32 / HEIGHT as f32;
             let proj = Mat4::perspective_rh_gl(60f32.to_radians(), aspect, 0.1, 100.0);
             let mvp = proj * view * model;
 
-            // Build varyings
+            // Build varyings for cube
             let mut var: Vec<Varyings> = Vec::with_capacity(verts_w.len());
             for v in &verts_w {
                 let world_pos = (model * v.pos.extend(1.0)).truncate();
@@ -522,6 +568,7 @@ async fn main() {
             }
 
             let time = params.time;
+            let light_dir = params.light_dir.normalize();
             tasks.into_par_iter().for_each(|mut t|
             {
                 for &ti in &t.bin {
@@ -530,7 +577,75 @@ async fn main() {
                     let b = var[idxs[1] as usize];
                     let c = var[idxs[2] as usize];
                     let material = tri_materials[ti];
-                    draw_triangle_band(&mut t.band, &a, &b, &c, light_dir, cam_pos, time, material);
+                    draw_triangle_band(&mut t.band, &a, &b, &c, light_dir, params.cam_pos, time, material);
+                }
+            });
+
+            // Now render the sphere: build transforms (place sphere offset) and draw
+            let sphere_model = Mat4::from_translation(vec3(-1.8, 0.0, 0.0));
+            let sphere_mvp = proj * view * sphere_model;
+            let mut svar: Vec<Varyings> = Vec::with_capacity(sphere_verts_w.len());
+            for v in &sphere_verts_w {
+                let world_pos = (sphere_model * v.pos.extend(1.0)).truncate();
+                let clip: Vec4 = sphere_mvp * v.pos.extend(1.0);
+                let inv_w = 1.0 / clip.w;
+                let ndc = (clip.truncate() * inv_w).clamp(vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0));
+                let screen = to_screen(ndc);
+                let normal_ws = (sphere_model * v.normal.extend(0.0)).truncate();
+                svar.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
+            }
+
+            // Bin sphere triangles
+            let rows_per_band = CHUNK_ROWS;
+            let num_bands = (HEIGHT + rows_per_band - 1) / rows_per_band;
+            let mut bins: Vec<Vec<usize>> = vec![Vec::new(); num_bands];
+            for (ti, t) in sphere_tris_w.iter().enumerate() {
+                let a = svar[t[0] as usize].screen;
+                let b = svar[t[1] as usize].screen;
+                let c = svar[t[2] as usize].screen;
+                if edge(a, b, c) >= 0.0 { continue; }
+                let mut min_y = a.y.min(b.y).min(c.y).floor() as i32;
+                let mut max_y = a.y.max(b.y).max(c.y).ceil() as i32;
+                min_y = clamp_i32(min_y, 0, (HEIGHT - 1) as i32);
+                max_y = clamp_i32(max_y, 0, (HEIGHT - 1) as i32);
+                if min_y > max_y { continue; }
+                let first_band = (min_y as usize) / rows_per_band;
+                let last_band = (max_y as usize) / rows_per_band;
+                for bi in first_band..=last_band { bins[bi].push(ti); }
+            }
+
+            // Rebuild bands over current color/depth slices
+            let mut bands: Vec<Band> = Vec::new();
+            let mut y0 = 0usize;
+            let tints: [u32; 12] = [
+                0xFFFF0000,0xFF00FF00,0xFF0000FF,0xFFFFFF00,0xFFFF00FF,0xFF00FFFF,
+                0xFFFF8000,0xFF8080FF,0xFF80FF80,0xFFFF80FF,0xFF80FFFF,0xFFFFFF80,
+            ];
+            let debug = params.debug;
+            let mut band_id = 0usize;
+            for (c_chunk, d_chunk) in color.chunks_mut(rows_per_band * WIDTH).zip(depth.chunks_mut(rows_per_band * WIDTH)) {
+                let rows = c_chunk.len() / WIDTH; if rows == 0 { continue; }
+                let y_start = y0 as i32; let y_end = (y0 + rows) as i32;
+                let tint = tints[band_id % tints.len()];
+                bands.push(Band { color: c_chunk, depth: d_chunk, w: WIDTH, y0: y_start, y1: y_end, tint, debug });
+                y0 += rows; band_id += 1;
+            }
+
+            struct BandTask2<'a> { band: Band<'a>, bin: Vec<usize> }
+            let mut tasks2: Vec<BandTask2> = Vec::with_capacity(bands.len());
+            for (i, band) in bands.into_iter().enumerate() {
+                use std::mem; let bin = mem::take(&mut bins[i]);
+                tasks2.push(BandTask2 { band, bin });
+            }
+
+            tasks2.into_par_iter().for_each(|mut t| {
+                for &ti in &t.bin {
+                    let idxs = sphere_tris_w[ti];
+                    let a = svar[idxs[0] as usize];
+                    let b = svar[idxs[1] as usize];
+                    let c = svar[idxs[2] as usize];
+                    // Sphere material: use checker to visualize UVs
+                    draw_triangle_band(&mut t.band, &a, &b, &c, light_dir, params.cam_pos, time, Material::Checker);
                 }
             });
 
@@ -547,15 +662,46 @@ async fn main() {
     let mut debug: bool = false;
     let mut last_present = Instant::now();
     let mut fps_ema: f32 = 0.0;
+    // Camera state
+    let mut cam_pos = vec3(0.0, 0.0, 3.0);
+    let mut yaw: f32 = 0.0;   // radians around Y
+    let mut pitch: f32 = 0.0; // radians up/down
+    let mut last_frame = Instant::now();
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        let now_loop = Instant::now();
+        let dt = now_loop.duration_since(last_frame).as_secs_f32().min(0.05);
+        last_frame = now_loop;
         // Toggle debug mode on key press (no repeat)
         if window.is_key_pressed(Key::D, KeyRepeat::No) {
             debug = !debug;
         }
 
-        angle += 0.8 * (1.0 / 60.0);
+        // Object rotation (cube)
+        angle += 0.8 * dt;
+        // Camera controls
+        let turn_speed = 1.8; // rad/s
+        if window.is_key_down(Key::Left) { yaw -= turn_speed * dt; }
+        if window.is_key_down(Key::Right) { yaw += turn_speed * dt; }
+        if window.is_key_down(Key::Up) { pitch = (pitch + turn_speed * dt).min(1.2); }
+        if window.is_key_down(Key::Down) { pitch = (pitch - turn_speed * dt).max(-1.2); }
+
+        let forward = vec3(yaw.sin()*pitch.cos(), pitch.sin(), yaw.cos()*pitch.cos());
+        let right = vec3(forward.z, 0.0, -forward.x).normalize();
+        let up_vec = vec3(0.0, 1.0, 0.0);
+        let move_speed = if window.is_key_down(Key::LeftShift) { 4.0 } else { 2.0 };
+        if window.is_key_down(Key::W) { cam_pos += forward * move_speed * dt; }
+        if window.is_key_down(Key::S) { cam_pos -= forward * move_speed * dt; }
+        if window.is_key_down(Key::A) { cam_pos -= right * move_speed * dt; }
+        if window.is_key_down(Key::D) { cam_pos += right * move_speed * dt; }
+        if window.is_key_down(Key::Q) { cam_pos -= up_vec * move_speed * dt; }
+        if window.is_key_down(Key::E) { cam_pos += up_vec * move_speed * dt; }
+
         let time = start_time.elapsed().as_secs_f32();
-        let _ = scene_tx.send(SceneParams { angle, debug, time });
+        // Rotating light around Y axis
+        let light_radius = 1.0;
+        let light_dir = vec3((time * 0.7).cos() * light_radius, 0.6, (time * 0.7).sin() * light_radius).normalize();
+        let cam_target = cam_pos + forward;
+        let _ = scene_tx.send(SceneParams { angle, debug, time, cam_pos, cam_target, light_dir });
 
         if let Some(color) = from_worker_rx.try_recv().ok() {
             // Present
@@ -569,7 +715,7 @@ async fn main() {
             let inst_fps = 1.0 / dt;
             fps_ema = if fps_ema == 0.0 { inst_fps } else { fps_ema * 0.9 + inst_fps * 0.1 };
             window.set_title(&format!(
-                "Software 3D Renderer (Rust) | {:5.1} FPS | Debug {}",
+                "Software 3D Renderer (Rust) | {:5.1} FPS | Debug {} | WASD/QE move, Arrow keys look",
                 fps_ema,
                 if debug { "ON" } else { "OFF" }
             ));
