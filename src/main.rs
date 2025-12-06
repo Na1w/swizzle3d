@@ -1,6 +1,7 @@
 use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec4};
 use rayon::prelude::*;
-use minifb::{Key, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, Window, WindowOptions};
+use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 
 const WIDTH: usize = 800;
@@ -195,12 +196,45 @@ struct Band<'a> {
     w: usize,
     y0: i32,
     y1: i32,
+    // debug visualization
+    id: usize,
+    tint: u32,   // ARGB tint assigned to this band
+    debug: bool, // whether to apply visualization
 }
 
 #[inline]
 fn band_idx(band: &Band, x: i32, y: i32) -> usize {
     let local_row = (y - band.y0) as usize;
     local_row * band.w + (x as usize)
+}
+
+#[inline]
+fn lerp_u8(a: u8, b: u8, t_num: u8, t_den: u8) -> u8 {
+    // integer linear interpolation: a*(1-t)+b*t with t=t_num/t_den
+    let a16 = a as u16;
+    let b16 = b as u16;
+    let t = t_num as u16;
+    let den = t_den as u16;
+    let res = (a16 * (den - t) + b16 * t + (den / 2)) / den;
+    res as u8
+}
+
+#[inline]
+fn blend_tint_argb(color: u32, tint: u32, t_num: u8, t_den: u8) -> u32 {
+    // ARGB channels
+    let a = ((color >> 24) & 0xFF) as u8;
+    let cr = ((color >> 16) & 0xFF) as u8;
+    let cg = ((color >> 8) & 0xFF) as u8;
+    let cb = (color & 0xFF) as u8;
+
+    let tr = ((tint >> 16) & 0xFF) as u8;
+    let tg = ((tint >> 8) & 0xFF) as u8;
+    let tb = (tint & 0xFF) as u8;
+
+    let r = lerp_u8(cr, tr, t_num, t_den) as u32;
+    let g = lerp_u8(cg, tg, t_num, t_den) as u32;
+    let b = lerp_u8(cb, tb, t_num, t_den) as u32;
+    ((a as u32) << 24) | (r << 16) | (g << 8) | b
 }
 
 fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyings, light_dir: Vec3, cam_pos: Vec3) {
@@ -248,7 +282,12 @@ fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyin
             let r = (rgb.x * 255.0) as u32;
             let g = (rgb.y * 255.0) as u32;
             let b = (rgb.z * 255.0) as u32;
-            band.color[idx] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+            let mut px = (0xFF << 24) | (r << 16) | (g << 8) | b;
+            if band.debug {
+                // blend 20% of band tint
+                px = blend_tint_argb(px, band.tint, 51, 255); // ~0.2
+            }
+            band.color[idx] = px;
             band.depth[idx] = z;
         }
     }
@@ -279,8 +318,8 @@ async fn main() {
     let (from_worker_tx, mut from_worker_rx) = mpsc::channel::<Vec<u32>>(2);
     // Scene params (watch latest angle)
     #[derive(Clone, Copy)]
-    struct SceneParams { angle: f32 }
-    let (scene_tx, scene_rx) = watch::channel(SceneParams { angle: 0.0 });
+    struct SceneParams { angle: f32, debug: bool }
+    let (scene_tx, scene_rx) = watch::channel(SceneParams { angle: 0.0, debug: false });
 
     // Preallocate double buffers and send to worker
     let buf_size = WIDTH * HEIGHT;
@@ -334,6 +373,23 @@ async fn main() {
             // Safety: split disjointly by rows
             let mut bands: Vec<Band> = Vec::new();
             let mut y0 = 0usize;
+            // Distinct tint colors for debug visualization (ARGB)
+            let tints: [u32; 12] = [
+                0xFFFF0000, // red
+                0xFF00FF00, // green
+                0xFF0000FF, // blue
+                0xFFFFFF00, // yellow
+                0xFFFF00FF, // magenta
+                0xFF00FFFF, // cyan
+                0xFFFF8000, // orange
+                0xFF8080FF, // light blue
+                0xFF80FF80, // light green
+                0xFFFF80FF, // pink
+                0xFF80FFFF, // light cyan
+                0xFFFFFF80, // light yellow
+            ];
+            let debug = params.debug;
+            let mut band_id = 0usize;
             for (c_chunk, d_chunk) in color
                 .chunks_mut(rows_per_band * WIDTH)
                 .zip(depth.chunks_mut(rows_per_band * WIDTH))
@@ -342,8 +398,10 @@ async fn main() {
                 if rows == 0 { continue; }
                 let y_start = y0 as i32;
                 let y_end = (y0 + rows) as i32;
-                bands.push(Band { color: c_chunk, depth: d_chunk, w: WIDTH, y0: y_start, y1: y_end });
+                let tint = tints[band_id % tints.len()];
+                bands.push(Band { color: c_chunk, depth: d_chunk, w: WIDTH, y0: y_start, y1: y_end, id: band_id, tint, debug });
                 y0 += rows;
+                band_id += 1;
             }
 
             bands.into_par_iter().for_each(|mut band| {
@@ -364,15 +422,34 @@ async fn main() {
 
     // Main loop: update params, present completed frames, recycle buffers
     let mut angle: f32 = 0.0;
+    let mut debug: bool = false;
+    let mut last_present = Instant::now();
+    let mut fps_ema: f32 = 0.0;
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Toggle debug mode on key press (no repeat)
+        if window.is_key_pressed(Key::D, KeyRepeat::No) {
+            debug = !debug;
+        }
+
         angle += 0.8 * (1.0 / 60.0);
-        let _ = scene_tx.send(SceneParams { angle });
+        let _ = scene_tx.send(SceneParams { angle, debug });
 
         if let Some(color) = from_worker_rx.try_recv().ok() {
             // Present
             window
                 .update_with_buffer(&color, WIDTH, HEIGHT)
                 .expect("Failed to update window");
+            // FPS update
+            let now = Instant::now();
+            let dt = now.duration_since(last_present).as_secs_f32().max(1e-6);
+            last_present = now;
+            let inst_fps = 1.0 / dt;
+            fps_ema = if fps_ema == 0.0 { inst_fps } else { fps_ema * 0.9 + inst_fps * 0.1 };
+            window.set_title(&format!(
+                "Software 3D Renderer (Rust) | {:5.1} FPS | Debug {}",
+                fps_ema,
+                if debug { "ON" } else { "OFF" }
+            ));
             // Recycle buffer
             let _ = to_worker_tx.try_send(color);
         } else {
