@@ -6,6 +6,8 @@ use tokio::sync::{mpsc, watch};
 
 const WIDTH: usize = 800;
 const HEIGHT: usize = 600;
+// Fine-grained work partitioning: number of rows per chunk (tile height)
+const CHUNK_ROWS: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
 struct Vertex {
@@ -366,9 +368,29 @@ async fn main() {
                 var.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
             }
 
-            // Partition into bands over color/depth slices
-            let threads = rayon::current_num_threads().max(1);
-            let rows_per_band = (HEIGHT + threads - 1) / threads;
+            // Partition into fine-grained row chunks and bin triangles per chunk
+            let rows_per_band = CHUNK_ROWS;
+            let num_bands = (HEIGHT + rows_per_band - 1) / rows_per_band;
+
+            // Triangle bins per band (by y-range)
+            let mut bins: Vec<Vec<usize>> = vec![Vec::new(); num_bands];
+            for (ti, t) in tris_w.iter().enumerate() {
+                let a = var[t[0] as usize].screen;
+                let b = var[t[1] as usize].screen;
+                let c = var[t[2] as usize].screen;
+                // Backface cull early to avoid binning backfaces
+                if edge(a, b, c) >= 0.0 { continue; }
+                let mut min_y = a.y.min(b.y).min(c.y).floor() as i32;
+                let mut max_y = a.y.max(b.y).max(c.y).ceil() as i32;
+                min_y = clamp_i32(min_y, 0, (HEIGHT - 1) as i32);
+                max_y = clamp_i32(max_y, 0, (HEIGHT - 1) as i32);
+                if min_y > max_y { continue; }
+                let first_band = (min_y as usize) / rows_per_band;
+                let last_band = (max_y as usize) / rows_per_band;
+                for bi in first_band..=last_band {
+                    bins[bi].push(ti);
+                }
+            }
 
             // Safety: split disjointly by rows
             let mut bands: Vec<Band> = Vec::new();
@@ -404,12 +426,27 @@ async fn main() {
                 band_id += 1;
             }
 
-            bands.into_par_iter().for_each(|mut band| {
-                for t in &tris_w {
-                    let a = var[t[0] as usize];
-                    let b = var[t[1] as usize];
-                    let c = var[t[2] as usize];
-                    draw_triangle_band(&mut band, &a, &b, &c, light_dir, cam_pos);
+            // Pair each band with its bin and process in parallel
+            struct BandTask<'a> {
+                band: Band<'a>,
+                bin: Vec<usize>,
+            }
+            let mut tasks: Vec<BandTask> = Vec::with_capacity(bands.len());
+            for (i, band) in bands.into_iter().enumerate() {
+                // move bin out without cloning extra capacity
+                use std::mem;
+                let bin = mem::take(&mut bins[i]);
+                tasks.push(BandTask { band, bin });
+            }
+
+            tasks.into_par_iter().for_each(|mut t|
+            {
+                for &ti in &t.bin {
+                    let idxs = tris_w[ti];
+                    let a = var[idxs[0] as usize];
+                    let b = var[idxs[1] as usize];
+                    let c = var[idxs[2] as usize];
+                    draw_triangle_band(&mut t.band, &a, &b, &c, light_dir, cam_pos);
                 }
             });
 
