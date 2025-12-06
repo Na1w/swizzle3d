@@ -1,0 +1,245 @@
+use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec4};
+use minifb::{Key, Window, WindowOptions};
+
+const WIDTH: usize = 800;
+const HEIGHT: usize = 600;
+
+#[derive(Clone, Copy, Debug)]
+struct Vertex {
+    pos: Vec3,
+    normal: Vec3,
+    uv: Vec2,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Varyings {
+    screen: Vec3, // x,y in pixels, z in NDC [-1,1]
+    inv_w: f32,   // 1 / clip_w for perspective correction
+    world_pos: Vec3,
+    normal: Vec3,
+    uv: Vec2,
+}
+
+struct Framebuffer {
+    color: Vec<u32>,
+    depth: Vec<f32>, // z-buffer in NDC [-1,1], lower is nearer after mapping
+    w: usize,
+    h: usize,
+}
+
+impl Framebuffer {
+    fn new(w: usize, h: usize) -> Self {
+        Self { color: vec![0x000000; w * h], depth: vec![f32::INFINITY; w * h], w, h }
+    }
+    fn clear(&mut self, rgba: u32) {
+        self.color.fill(rgba);
+        self.depth.fill(f32::INFINITY);
+    }
+    #[inline]
+    fn idx(&self, x: i32, y: i32) -> usize { (y as usize) * self.w + (x as usize) }
+}
+
+fn checkerboard(uv: Vec2) -> Vec3 {
+    // Simple, tile 8x8 checker
+    let scale = 8.0;
+    let u = (uv.x * scale).floor() as i32;
+    let v = (uv.y * scale).floor() as i32;
+    let c = ((u ^ v) & 1) as f32;
+    // Two colors
+    let a = vec3(0.12, 0.12, 0.12);
+    let b = vec3(0.85, 0.85, 0.85);
+    a * (1.0 - c) + b * c
+}
+
+fn lambert_shade(base_color: Vec3, normal_ws: Vec3, light_dir_ws: Vec3, view_dir_ws: Vec3) -> Vec3 {
+    let n = normal_ws.normalize();
+    let l = (-light_dir_ws).normalize(); // light_dir as direction from surface to light
+    let diffuse = n.dot(l).max(0.0);
+    let ambient = 0.15;
+    // Simple Blinn-Phong
+    let h = (l + view_dir_ws.normalize()).normalize();
+    let spec = n.dot(h).max(0.0).powf(32.0) * 0.25;
+    base_color * (ambient + 0.85 * diffuse) + vec3(spec, spec, spec)
+}
+
+fn to_screen(p: Vec3) -> Vec3 {
+    // p in NDC [-1,1]
+    let x = ((p.x + 1.0) * 0.5) * (WIDTH as f32);
+    let y = ((1.0 - (p.y + 1.0) * 0.5)) * (HEIGHT as f32);
+    vec3(x, y, p.z)
+}
+
+fn make_cube(size: f32) -> (Vec<Vertex>, Vec<[u32; 3]>) {
+    let s = size * 0.5;
+    // 24 unique vertices (per-face normals/uvs)
+    let p = [
+        vec3(-s, -s,  s), vec3( s, -s,  s), vec3( s,  s,  s), vec3(-s,  s,  s), // front +Z
+        vec3(-s, -s, -s), vec3(-s,  s, -s), vec3( s,  s, -s), vec3( s, -s, -s), // back -Z
+        vec3(-s,  s, -s), vec3(-s,  s,  s), vec3( s,  s,  s), vec3( s,  s, -s), // top +Y
+        vec3(-s, -s, -s), vec3( s, -s, -s), vec3( s, -s,  s), vec3(-s, -s,  s), // bottom -Y
+        vec3( s, -s, -s), vec3( s,  s, -s), vec3( s,  s,  s), vec3( s, -s,  s), // right +X
+        vec3(-s, -s, -s), vec3(-s, -s,  s), vec3(-s,  s,  s), vec3(-s,  s, -s), // left -X
+    ];
+    let n: [Vec3; 24] = [
+        // front +Z
+        vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, 1.0),
+        // back -Z
+        vec3(0.0, 0.0, -1.0), vec3(0.0, 0.0, -1.0), vec3(0.0, 0.0, -1.0), vec3(0.0, 0.0, -1.0),
+        // top +Y
+        vec3(0.0, 1.0, 0.0), vec3(0.0, 1.0, 0.0), vec3(0.0, 1.0, 0.0), vec3(0.0, 1.0, 0.0),
+        // bottom -Y
+        vec3(0.0, -1.0, 0.0), vec3(0.0, -1.0, 0.0), vec3(0.0, -1.0, 0.0), vec3(0.0, -1.0, 0.0),
+        // right +X
+        vec3(1.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0),
+        // left -X
+        vec3(-1.0, 0.0, 0.0), vec3(-1.0, 0.0, 0.0), vec3(-1.0, 0.0, 0.0), vec3(-1.0, 0.0, 0.0),
+    ];
+    let uv = [
+        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0),
+        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0),
+        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0),
+        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0),
+        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0),
+        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0),
+    ];
+
+    let mut verts = Vec::with_capacity(24);
+    for i in 0..24 {
+        verts.push(Vertex { pos: p[i], normal: n[i], uv: uv[i] });
+    }
+    let idx: Vec<[u32; 3]> = vec![
+        // front
+        [0, 1, 2], [0, 2, 3],
+        // back
+        [4, 5, 6], [4, 6, 7],
+        // top
+        [8, 9, 10], [8, 10, 11],
+        // bottom
+        [12, 13, 14], [12, 14, 15],
+        // right
+        [16, 17, 18], [16, 18, 19],
+        // left
+        [20, 21, 22], [20, 22, 23],
+    ];
+    (verts, idx)
+}
+
+fn ndc_depth_to_zbuf(ndc_z: f32) -> f32 {
+    // Map [-1,1] where -1 is near to a positive value; we'll use direct compare on depth with smaller closer.
+    // We initialized depth with +inf so we compare real z later.
+    ndc_z
+}
+
+fn edge(a: Vec3, b: Vec3, c: Vec3) -> f32 {
+    // 2D edge function using top-left rule
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+fn draw_triangle(fb: &mut Framebuffer, v0: &Varyings, v1: &Varyings, v2: &Varyings, light_dir: Vec3, cam_pos: Vec3) {
+    let p0 = v0.screen; let p1 = v1.screen; let p2 = v2.screen;
+
+    // Backface culling in screen space
+    let area = edge(p0, p1, p2);
+    if area >= 0.0 { return; }
+
+    // Bounding box
+    let min_x = p0.x.min(p1.x).min(p2.x).floor().max(0.0) as i32;
+    let max_x = p0.x.max(p1.x).max(p2.x).ceil().min((fb.w - 1) as f32) as i32;
+    let min_y = p0.y.min(p1.y).min(p2.y).floor().max(0.0) as i32;
+    let max_y = p0.y.max(p1.y).max(p2.y).ceil().min((fb.h - 1) as f32) as i32;
+
+    let inv_area = 1.0 / area;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let p = vec3(x as f32 + 0.5, y as f32 + 0.5, 0.0);
+            let w0 = edge(p1, p2, p) * inv_area;
+            let w1 = edge(p2, p0, p) * inv_area;
+            let w2 = edge(p0, p1, p) * inv_area;
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+
+            // Perspective-correct weights
+            let invw = v0.inv_w * w0 + v1.inv_w * w1 + v2.inv_w * w2;
+            let recip = 1.0 / invw;
+
+            let ndc_z = (v0.screen.z * v0.inv_w * w0 + v1.screen.z * v1.inv_w * w1 + v2.screen.z * v2.inv_w * w2) * recip;
+            let z = ndc_depth_to_zbuf(ndc_z);
+            let idx = fb.idx(x, y);
+            if z >= fb.depth[idx] { continue; }
+
+            let uv = (v0.uv * v0.inv_w * w0 + v1.uv * v1.inv_w * w1 + v2.uv * v2.inv_w * w2) * recip;
+            let normal = (v0.normal * v0.inv_w * w0 + v1.normal * v1.inv_w * w1 + v2.normal * v2.inv_w * w2) * recip;
+            let world_pos = (v0.world_pos * v0.inv_w * w0 + v1.world_pos * v1.inv_w * w1 + v2.world_pos * v2.inv_w * w2) * recip;
+
+            let base = checkerboard(uv);
+            let view_dir = (cam_pos - world_pos).normalize();
+            let rgb = lambert_shade(base, normal, light_dir, view_dir).clamp(vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
+            let r = (rgb.x * 255.0) as u32;
+            let g = (rgb.y * 255.0) as u32;
+            let b = (rgb.z * 255.0) as u32;
+            fb.color[idx] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+            fb.depth[idx] = z;
+        }
+    }
+}
+
+fn main() {
+    let mut window = Window::new(
+        "Software 3D Renderer (Rust)",
+        WIDTH,
+        HEIGHT,
+        WindowOptions { resize: true, ..WindowOptions::default() },
+    )
+    .expect("Unable to create window");
+
+    window.limit_update_rate(Some(std::time::Duration::from_micros(16_667))); // ~60 FPS
+
+    let (verts, tris) = make_cube(1.6);
+    let mut fb = Framebuffer::new(WIDTH, HEIGHT);
+
+    // Camera
+    let cam_pos = vec3(0.0, 0.0, 3.0);
+    let target = vec3(0.0, 0.0, 0.0);
+    let up = vec3(0.0, 1.0, 0.0);
+
+    let mut angle: f32 = 0.0;
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        fb.clear(0xFF101018);
+
+        angle += 0.8 * (1.0 / 60.0);
+        let model = Mat4::from_rotation_y(angle) * Mat4::from_rotation_x(angle * 0.5);
+        let view = Mat4::look_at_rh(cam_pos, target, up);
+        let aspect = WIDTH as f32 / HEIGHT as f32;
+        let proj = Mat4::perspective_rh_gl(60f32.to_radians(), aspect, 0.1, 100.0);
+        let mvp = proj * view * model;
+
+        // Light
+        let light_dir = vec3(0.6, 0.7, 0.2).normalize();
+
+        // Transform vertices to clip and prepare varyings
+        let mut var: Vec<Varyings> = Vec::with_capacity(verts.len());
+        for v in &verts {
+            let world_pos = (model * v.pos.extend(1.0)).truncate();
+            let clip: Vec4 = mvp * v.pos.extend(1.0);
+            let inv_w = 1.0 / clip.w;
+            let ndc = (clip.truncate() * inv_w).clamp(vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0));
+            let screen = to_screen(ndc);
+            // Transform normal by inverse transpose of model (no nonuniform scale here, simple rotation)
+            let normal_ws = (model * v.normal.extend(0.0)).truncate();
+            var.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
+        }
+
+        // Draw triangles
+        for t in &tris {
+            let a = var[t[0] as usize];
+            let b = var[t[1] as usize];
+            let c = var[t[2] as usize];
+            draw_triangle(&mut fb, &a, &b, &c, light_dir, cam_pos);
+        }
+
+        // Present
+        window
+            .update_with_buffer(&fb.color, fb.w, fb.h)
+            .expect("Failed to update window");
+    }
+}

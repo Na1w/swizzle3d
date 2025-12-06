@@ -1,0 +1,11 @@
+[package]
+name = "untitled"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+# Cross‑platform window and pixel buffer
+minifb = "0.25"
+# Fast SIMD math for vectors/matrices
+glam = "0.27"
