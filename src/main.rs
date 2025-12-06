@@ -1,6 +1,7 @@
 use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec4};
 use rayon::prelude::*;
 use minifb::{Key, Window, WindowOptions};
+use tokio::sync::{mpsc, watch};
 
 const WIDTH: usize = 800;
 const HEIGHT: usize = 600;
@@ -253,7 +254,8 @@ fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyin
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut window = Window::new(
         "Software 3D Renderer (Rust)",
         WIDTH,
@@ -265,63 +267,87 @@ fn main() {
     window.limit_update_rate(Some(std::time::Duration::from_micros(16_667))); // ~60 FPS
 
     let (verts, tris) = make_cube(1.6);
-    let mut fb = Framebuffer::new(WIDTH, HEIGHT);
 
     // Camera
     let cam_pos = vec3(0.0, 0.0, 3.0);
     let target = vec3(0.0, 0.0, 0.0);
     let up = vec3(0.0, 1.0, 0.0);
+    let light_dir = vec3(0.6, 0.7, 0.2).normalize();
 
-    let mut angle: f32 = 0.0;
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        fb.clear(0xFF101018);
+    // Channels: free buffers -> worker, completed frames -> main
+    let (to_worker_tx, mut to_worker_rx) = mpsc::channel::<Vec<u32>>(2);
+    let (from_worker_tx, mut from_worker_rx) = mpsc::channel::<Vec<u32>>(2);
+    // Scene params (watch latest angle)
+    #[derive(Clone, Copy)]
+    struct SceneParams { angle: f32 }
+    let (scene_tx, scene_rx) = watch::channel(SceneParams { angle: 0.0 });
 
-        angle += 0.8 * (1.0 / 60.0);
-        let model = Mat4::from_rotation_y(angle) * Mat4::from_rotation_x(angle * 0.5);
-        let view = Mat4::look_at_rh(cam_pos, target, up);
-        let aspect = WIDTH as f32 / HEIGHT as f32;
-        let proj = Mat4::perspective_rh_gl(60f32.to_radians(), aspect, 0.1, 100.0);
-        let mvp = proj * view * model;
+    // Preallocate double buffers and send to worker
+    let buf_size = WIDTH * HEIGHT;
+    to_worker_tx.send(vec![0xFF101018; buf_size]).await.ok();
+    to_worker_tx.send(vec![0xFF101018; buf_size]).await.ok();
 
-        // Light
-        let light_dir = vec3(0.6, 0.7, 0.2).normalize();
+    // Spawn render worker (async task; heavy compute uses Rayon internally)
+    let verts_w = verts.clone();
+    let tris_w = tris.clone();
+    tokio::spawn(async move {
+        // Depth buffer reused inside worker
+        let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
+        let cam_pos = cam_pos; // move into task
+        let target = target;
+        let up = up;
+        let light_dir = light_dir;
+        let mut scene_rx = scene_rx;
 
-        // Transform vertices to clip and prepare varyings
-        let mut var: Vec<Varyings> = Vec::with_capacity(verts.len());
-        for v in &verts {
-            let world_pos = (model * v.pos.extend(1.0)).truncate();
-            let clip: Vec4 = mvp * v.pos.extend(1.0);
-            let inv_w = 1.0 / clip.w;
-            let ndc = (clip.truncate() * inv_w).clamp(vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0));
-            let screen = to_screen(ndc);
-            // Transform normal by inverse transpose of model (no nonuniform scale here, simple rotation)
-            let normal_ws = (model * v.normal.extend(0.0)).truncate();
-            var.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
-        }
+        while let Some(mut color) = to_worker_rx.recv().await {
+            // Read latest scene params
+            let params = *scene_rx.borrow();
 
-        // Draw triangles (multithreaded by vertical bands)
-        let threads = rayon::current_num_threads().max(1);
-        let rows_per_band = (fb.h + threads - 1) / threads;
+            // Clear buffers
+            color.fill(0xFF101018);
+            depth.fill(f32::INFINITY);
 
-        // Build bands with disjoint slices
-        let mut bands: Vec<Band> = Vec::new();
-        let mut y0 = 0usize;
-        for (c_chunk, d_chunk) in fb
-            .color
-            .chunks_mut(rows_per_band * fb.w)
-            .zip(fb.depth.chunks_mut(rows_per_band * fb.w))
-        {
-            let rows = c_chunk.len() / fb.w;
-            let y_start = y0 as i32;
-            let y_end = (y0 + rows) as i32;
-            bands.push(Band { color: c_chunk, depth: d_chunk, w: fb.w, y0: y_start, y1: y_end });
-            y0 += rows;
-        }
+            // Compute transforms for this frame
+            let angle = params.angle;
+            let model = Mat4::from_rotation_y(angle) * Mat4::from_rotation_x(angle * 0.5);
+            let view = Mat4::look_at_rh(cam_pos, target, up);
+            let aspect = WIDTH as f32 / HEIGHT as f32;
+            let proj = Mat4::perspective_rh_gl(60f32.to_radians(), aspect, 0.1, 100.0);
+            let mvp = proj * view * model;
 
-        bands
-            .into_par_iter()
-            .for_each(|mut band| {
-                for t in &tris {
+            // Build varyings
+            let mut var: Vec<Varyings> = Vec::with_capacity(verts_w.len());
+            for v in &verts_w {
+                let world_pos = (model * v.pos.extend(1.0)).truncate();
+                let clip: Vec4 = mvp * v.pos.extend(1.0);
+                let inv_w = 1.0 / clip.w;
+                let ndc = (clip.truncate() * inv_w).clamp(vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0));
+                let screen = to_screen(ndc);
+                let normal_ws = (model * v.normal.extend(0.0)).truncate();
+                var.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
+            }
+
+            // Partition into bands over color/depth slices
+            let threads = rayon::current_num_threads().max(1);
+            let rows_per_band = (HEIGHT + threads - 1) / threads;
+
+            // Safety: split disjointly by rows
+            let mut bands: Vec<Band> = Vec::new();
+            let mut y0 = 0usize;
+            for (c_chunk, d_chunk) in color
+                .chunks_mut(rows_per_band * WIDTH)
+                .zip(depth.chunks_mut(rows_per_band * WIDTH))
+            {
+                let rows = c_chunk.len() / WIDTH;
+                if rows == 0 { continue; }
+                let y_start = y0 as i32;
+                let y_end = (y0 + rows) as i32;
+                bands.push(Band { color: c_chunk, depth: d_chunk, w: WIDTH, y0: y_start, y1: y_end });
+                y0 += rows;
+            }
+
+            bands.into_par_iter().for_each(|mut band| {
+                for t in &tris_w {
                     let a = var[t[0] as usize];
                     let b = var[t[1] as usize];
                     let c = var[t[2] as usize];
@@ -329,9 +355,29 @@ fn main() {
                 }
             });
 
-        // Present
-        window
-            .update_with_buffer(&fb.color, fb.w, fb.h)
-            .expect("Failed to update window");
+            // Send completed frame back
+            if from_worker_tx.send(color).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Main loop: update params, present completed frames, recycle buffers
+    let mut angle: f32 = 0.0;
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        angle += 0.8 * (1.0 / 60.0);
+        let _ = scene_tx.send(SceneParams { angle });
+
+        if let Some(color) = from_worker_rx.try_recv().ok() {
+            // Present
+            window
+                .update_with_buffer(&color, WIDTH, HEIGHT)
+                .expect("Failed to update window");
+            // Recycle buffer
+            let _ = to_worker_tx.try_send(color);
+        } else {
+            // No new frame ready yet; keep window responsive
+            window.update();
+        }
     }
 }
