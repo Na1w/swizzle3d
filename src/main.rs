@@ -1,4 +1,5 @@
 use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec4};
+use rayon::prelude::*;
 use minifb::{Key, Window, WindowOptions};
 
 const WIDTH: usize = 800;
@@ -135,6 +136,9 @@ fn edge(a: Vec3, b: Vec3, c: Vec3) -> f32 {
     (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
 }
 
+#[inline]
+fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 { v.max(lo).min(hi) }
+
 fn draw_triangle(fb: &mut Framebuffer, v0: &Varyings, v1: &Varyings, v2: &Varyings, light_dir: Vec3, cam_pos: Vec3) {
     let p0 = v0.screen; let p1 = v1.screen; let p2 = v2.screen;
 
@@ -179,6 +183,72 @@ fn draw_triangle(fb: &mut Framebuffer, v0: &Varyings, v1: &Varyings, v2: &Varyin
             let b = (rgb.z * 255.0) as u32;
             fb.color[idx] = (0xFF << 24) | (r << 16) | (g << 8) | b;
             fb.depth[idx] = z;
+        }
+    }
+}
+
+// A band is a disjoint vertical range of rows [y0, y1) with exclusive access to its color/depth slices.
+struct Band<'a> {
+    color: &'a mut [u32],
+    depth: &'a mut [f32],
+    w: usize,
+    y0: i32,
+    y1: i32,
+}
+
+#[inline]
+fn band_idx(band: &Band, x: i32, y: i32) -> usize {
+    let local_row = (y - band.y0) as usize;
+    local_row * band.w + (x as usize)
+}
+
+fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyings, light_dir: Vec3, cam_pos: Vec3) {
+    let p0 = v0.screen; let p1 = v1.screen; let p2 = v2.screen;
+
+    // Backface culling in screen space
+    let area = edge(p0, p1, p2);
+    if area >= 0.0 { return; }
+
+    // Bounding box clamped to band rows
+    let min_x = p0.x.min(p1.x).min(p2.x).floor().max(0.0) as i32;
+    let max_x = p0.x.max(p1.x).max(p2.x).ceil().min((band.w - 1) as f32) as i32;
+    let mut min_y = p0.y.min(p1.y).min(p2.y).floor() as i32;
+    let mut max_y = p0.y.max(p1.y).max(p2.y).ceil() as i32;
+    min_y = clamp_i32(min_y, band.y0, band.y1 - 1);
+    max_y = clamp_i32(max_y, band.y0, band.y1 - 1);
+    if min_y > max_y { return; }
+
+    let inv_area = 1.0 / area;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let p = vec3(x as f32 + 0.5, y as f32 + 0.5, 0.0);
+            let w0 = edge(p1, p2, p) * inv_area;
+            let w1 = edge(p2, p0, p) * inv_area;
+            let w2 = edge(p0, p1, p) * inv_area;
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+
+            // Perspective-correct weights
+            let invw = v0.inv_w * w0 + v1.inv_w * w1 + v2.inv_w * w2;
+            let recip = 1.0 / invw;
+
+            let ndc_z = (v0.screen.z * v0.inv_w * w0 + v1.screen.z * v1.inv_w * w1 + v2.screen.z * v2.inv_w * w2) * recip;
+            let z = ndc_depth_to_zbuf(ndc_z);
+            let idx = band_idx(band, x, y);
+            if z >= band.depth[idx] { continue; }
+
+            let uv = (v0.uv * v0.inv_w * w0 + v1.uv * v1.inv_w * w1 + v2.uv * v2.inv_w * w2) * recip;
+            let normal = (v0.normal * v0.inv_w * w0 + v1.normal * v1.inv_w * w1 + v2.normal * v2.inv_w * w2) * recip;
+            let world_pos = (v0.world_pos * v0.inv_w * w0 + v1.world_pos * v1.inv_w * w1 + v2.world_pos * v2.inv_w * w2) * recip;
+
+            let base = checkerboard(uv);
+            let view_dir = (cam_pos - world_pos).normalize();
+            let rgb = lambert_shade(base, normal, light_dir, view_dir).clamp(vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
+            let r = (rgb.x * 255.0) as u32;
+            let g = (rgb.y * 255.0) as u32;
+            let b = (rgb.z * 255.0) as u32;
+            band.color[idx] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+            band.depth[idx] = z;
         }
     }
 }
@@ -229,13 +299,35 @@ fn main() {
             var.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
         }
 
-        // Draw triangles
-        for t in &tris {
-            let a = var[t[0] as usize];
-            let b = var[t[1] as usize];
-            let c = var[t[2] as usize];
-            draw_triangle(&mut fb, &a, &b, &c, light_dir, cam_pos);
+        // Draw triangles (multithreaded by vertical bands)
+        let threads = rayon::current_num_threads().max(1);
+        let rows_per_band = (fb.h + threads - 1) / threads;
+
+        // Build bands with disjoint slices
+        let mut bands: Vec<Band> = Vec::new();
+        let mut y0 = 0usize;
+        for (c_chunk, d_chunk) in fb
+            .color
+            .chunks_mut(rows_per_band * fb.w)
+            .zip(fb.depth.chunks_mut(rows_per_band * fb.w))
+        {
+            let rows = c_chunk.len() / fb.w;
+            let y_start = y0 as i32;
+            let y_end = (y0 + rows) as i32;
+            bands.push(Band { color: c_chunk, depth: d_chunk, w: fb.w, y0: y_start, y1: y_end });
+            y0 += rows;
         }
+
+        bands
+            .into_par_iter()
+            .for_each(|mut band| {
+                for t in &tris {
+                    let a = var[t[0] as usize];
+                    let b = var[t[1] as usize];
+                    let c = var[t[2] as usize];
+                    draw_triangle_band(&mut band, &a, &b, &c, light_dir, cam_pos);
+                }
+            });
 
         // Present
         window
