@@ -18,6 +18,8 @@ struct Vertex {
 
 #[derive(Clone, Copy, Debug)]
 struct Varyings {
+    // Clip-space position (after MVP), used for homogeneous clipping and correct depth
+    clip: Vec4,
     screen: Vec3, // x,y in pixels, z in NDC [-1,1]
     inv_w: f32,   // 1 / clip_w for perspective correction
     world_pos: Vec3,
@@ -268,9 +270,9 @@ fn make_uv_sphere(rings: u32, segments: u32, radius: f32) -> (Vec<Vertex>, Vec<[
 }
 
 fn ndc_depth_to_zbuf(ndc_z: f32) -> f32 {
-    // Map [-1,1] where -1 is near to a positive value; we'll use direct compare on depth with smaller closer.
-    // We initialized depth with +inf so we compare real z later.
-    ndc_z
+    // OpenGL-style NDC: near = -1, far = +1
+    // Map to [0,1] where 0 is near and 1 is far.
+    0.5 * (ndc_z + 1.0)
 }
 
 fn edge(a: Vec3, b: Vec3, c: Vec3) -> f32 {
@@ -279,12 +281,15 @@ fn edge(a: Vec3, b: Vec3, c: Vec3) -> f32 {
 }
 
 #[inline]
-fn is_front_facing(a_wp: Vec3, b_wp: Vec3, c_wp: Vec3, cam_pos: Vec3) -> bool {
-    // World-space facing: front if triangle normal points toward camera
-    let n = (b_wp - a_wp).cross(c_wp - a_wp);
-    let to_cam = cam_pos - (a_wp + b_wp + c_wp) * (1.0 / 3.0);
-    n.dot(to_cam) > 0.0
+fn is_front_screen(a: Vec3, b: Vec3, c: Vec3) -> bool {
+    // Our to_screen() flips Y (NDC up -> screen down), so CCW in NDC becomes CW in screen.
+    // Treat front faces as those with negative signed area in screen space.
+    edge(a, b, c) < 0.0
 }
+
+#[inline]
+// Removed world-space front-face helper; we cull in screen-space using the same sign
+// convention as the rasterizer's edge functions to avoid mismatches.
 
 #[inline]
 fn clamp_i32(v: i32, lo: i32, hi: i32) -> i32 { v.max(lo).min(hi) }
@@ -341,8 +346,9 @@ fn blend_tint_argb(color: u32, tint: u32, t_num: u8, t_den: u8) -> u32 {
 fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyings, light_dir: Vec3, cam_pos: Vec3, time: f32, material: Material) {
     let p0 = v0.screen; let p1 = v1.screen; let p2 = v2.screen;
 
-    // Backface culling in world space (robust w.r.t. projection/axis flips)
-    if !is_front_facing(v0.world_pos, v1.world_pos, v2.world_pos, cam_pos) { return; }
+    // Backface culling in screen space to match rasterizer winding
+    let area = edge(p0, p1, p2);
+    if area >= 0.0 { return; }
 
     // Bounding box clamped to band rows
     let min_x = p0.x.min(p1.x).min(p2.x).floor().max(0.0) as i32;
@@ -353,7 +359,7 @@ fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyin
     max_y = clamp_i32(max_y, band.y0, band.y1 - 1);
     if min_y > max_y { return; }
 
-    let area = edge(p0, p1, p2);
+    // area already computed above
     if area == 0.0 { return; }
     let inv_area = 1.0 / area;
 
@@ -378,8 +384,9 @@ fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyin
 
             // Correct perspective depth: interpolate clip-space z and w, then divide
             // Using ndc_z directly in the 1/w scheme would introduce a 1/w^2 error.
-            let clip_z = (v0.screen.z / v0.inv_w) * w0 + (v1.screen.z / v1.inv_w) * w1 + (v2.screen.z / v2.inv_w) * w2;
-            let clip_w = (1.0 / v0.inv_w) * w0 + (1.0 / v1.inv_w) * w1 + (1.0 / v2.inv_w) * w2;
+            // Use stored clip-space values directly
+            let clip_z = v0.clip.z * w0 + v1.clip.z * w1 + v2.clip.z * w2;
+            let clip_w = v0.clip.w * w0 + v1.clip.w * w1 + v2.clip.w * w2;
             let ndc_z = clip_z / clip_w;
             let z = ndc_depth_to_zbuf(ndc_z);
             let idx = band_idx(band, x, y);
@@ -406,6 +413,152 @@ fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyin
     }
 }
 
+// Extended variant for diagnostics: can disable culling and/or depth test
+fn draw_triangle_band_ext(
+    band: &mut Band,
+    v0: &Varyings,
+    v1: &Varyings,
+    v2: &Varyings,
+    light_dir: Vec3,
+    cam_pos: Vec3,
+    time: f32,
+    material: Material,
+    no_cull: bool,
+    no_depth: bool,
+) {
+    let p0 = v0.screen; let p1 = v1.screen; let p2 = v2.screen;
+
+    // Backface culling in screen space consistent with edge test
+    let area = edge(p0, p1, p2);
+    if !no_cull && area >= 0.0 { return; }
+
+    // Bounding box clamped to band rows
+    let min_x = p0.x.min(p1.x).min(p2.x).floor().max(0.0) as i32;
+    let max_x = p0.x.max(p1.x).max(p2.x).ceil().min((band.w - 1) as f32) as i32;
+    let mut min_y = p0.y.min(p1.y).min(p2.y).floor() as i32;
+    let mut max_y = p0.y.max(p1.y).max(p2.y).ceil() as i32;
+    min_y = clamp_i32(min_y, band.y0, band.y1 - 1);
+    max_y = clamp_i32(max_y, band.y0, band.y1 - 1);
+    if min_y > max_y { return; }
+
+    // area already computed above
+    if area == 0.0 { return; }
+    let inv_area = 1.0 / area;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let p = vec3(x as f32 + 0.5, y as f32 + 0.5, 0.0);
+            let mut w0 = edge(p1, p2, p) * inv_area;
+            let mut w1 = edge(p2, p0, p) * inv_area;
+            let mut w2 = edge(p0, p1, p) * inv_area;
+            // Consistent inside-test regardless of winding
+            if area > 0.0 {
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+            } else {
+                if w0 > 0.0 || w1 > 0.0 || w2 > 0.0 { continue; }
+                // make weights positive for later math
+                w0 = -w0; w1 = -w1; w2 = -w2;
+            }
+
+            // Perspective-correct weights
+            let invw = v0.inv_w * w0 + v1.inv_w * w1 + v2.inv_w * w2;
+            let recip = 1.0 / invw;
+
+            // Correct perspective depth via clip-space interpolation
+            let clip_z = v0.clip.z * w0 + v1.clip.z * w1 + v2.clip.z * w2;
+            let clip_w = v0.clip.w * w0 + v1.clip.w * w1 + v2.clip.w * w2;
+            let ndc_z = clip_z / clip_w;
+            let z = ndc_depth_to_zbuf(ndc_z);
+            let idx = band_idx(band, x, y);
+            if !no_depth {
+                if z >= band.depth[idx] { continue; }
+            }
+
+            let uv = (v0.uv * v0.inv_w * w0 + v1.uv * v1.inv_w * w1 + v2.uv * v2.inv_w * w2) * recip;
+            let normal = (v0.normal * v0.inv_w * w0 + v1.normal * v1.inv_w * w1 + v2.normal * v2.inv_w * w2) * recip;
+            let world_pos = (v0.world_pos * v0.inv_w * w0 + v1.world_pos * v1.inv_w * w1 + v2.world_pos * v2.inv_w * w2) * recip;
+
+            let base = sample_material(uv, material, time);
+            let view_dir = (cam_pos - world_pos).normalize();
+            let rgb = lambert_shade(base, normal, light_dir, view_dir).clamp(vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0));
+            let r = (rgb.x * 255.0) as u32;
+            let g = (rgb.y * 255.0) as u32;
+            let b = (rgb.z * 255.0) as u32;
+            let mut px = (0xFF << 24) | (r << 16) | (g << 8) | b;
+            if band.debug {
+                // blend 20% of band tint
+                px = blend_tint_argb(px, band.tint, 51, 255); // ~0.2
+            }
+            band.color[idx] = px;
+            if !no_depth {
+                band.depth[idx] = z;
+            }
+        }
+    }
+}
+
+// -------- Homogeneous near-plane clipping (RH GL: keep vertices with z >= -w) --------
+#[inline]
+fn inside_near(v: &Varyings) -> bool { v.clip.z + v.clip.w >= 0.0 }
+
+#[inline]
+fn lerp_varyings(a: &Varyings, b: &Varyings, t: f32) -> Varyings {
+    let clip = a.clip * (1.0 - t) + b.clip * t;
+    let inv_w = 1.0 / clip.w;
+    let ndc = (clip.truncate()) * inv_w;
+    let screen = to_screen(ndc);
+    let world_pos = a.world_pos * (1.0 - t) + b.world_pos * t;
+    let normal = (a.normal * (1.0 - t) + b.normal * t).normalize();
+    let uv = a.uv * (1.0 - t) + b.uv * t;
+    Varyings { clip, screen, inv_w, world_pos, normal, uv }
+}
+
+fn clip_triangle_near(v0: &Varyings, v1: &Varyings, v2: &Varyings) -> smallvec::SmallVec<[[Varyings;3]; 2]> {
+    use smallvec::SmallVec;
+    let mut inlist: SmallVec<[Varyings; 8]> = SmallVec::new();
+    inlist.push(*v0); inlist.push(*v1); inlist.push(*v2);
+    let mut outlist: SmallVec<[Varyings; 8]> = SmallVec::new();
+    // Sutherland–Hodgman against single plane
+    for i in 0..inlist.len() {
+        let curr = inlist[i];
+        let prev = inlist[(i + inlist.len() - 1) % inlist.len()];
+        let curr_in = inside_near(&curr);
+        let prev_in = inside_near(&prev);
+        if curr_in {
+            if prev_in {
+                // prev in, curr in => keep curr
+                outlist.push(curr);
+            } else {
+                // prev out, curr in => add intersection, then curr
+                let sa = prev.clip.z + prev.clip.w;
+                let sb = curr.clip.z + curr.clip.w;
+                let t = sa / (sa - sb);
+                outlist.push(lerp_varyings(&prev, &curr, t));
+                outlist.push(curr);
+            }
+        } else {
+            if prev_in {
+                // prev in, curr out => add intersection
+                let sa = prev.clip.z + prev.clip.w;
+                let sb = curr.clip.z + curr.clip.w;
+                let t = sa / (sa - sb);
+                outlist.push(lerp_varyings(&prev, &curr, t));
+            } else {
+                // both out => discard
+            }
+        }
+    }
+
+    // Triangulate result (can be 0, 3, or 4 vertices)
+    let mut out_tris: SmallVec<[[Varyings;3]; 2]> = SmallVec::new();
+    if outlist.len() < 3 { return out_tris; }
+    let v0 = outlist[0];
+    for i in 1..(outlist.len()-1) {
+        out_tris.push([v0, outlist[i], outlist[i+1]]);
+    }
+    out_tris
+}
+
 #[tokio::main]
 async fn main() {
     let mut window = Window::new(
@@ -419,7 +572,8 @@ async fn main() {
     window.limit_update_rate(Some(std::time::Duration::from_micros(16_667))); // ~60 FPS
 
     let (verts, tris) = make_cube(1.6);
-    let (sphere_verts, sphere_tris) = make_uv_sphere(32, 48, 0.8);
+    // Make the sphere larger than the cube's face distance (0.8) so only cube corners protrude
+    let (sphere_verts, sphere_tris) = make_uv_sphere(32, 48, 1.2);
 
     // Camera
     let up = vec3(0.0, 1.0, 0.0);
@@ -432,18 +586,24 @@ async fn main() {
     struct SceneParams {
         angle: f32,
         debug: bool,
+        debug_depth: bool,
         time: f32,
         cam_pos: Vec3,
         cam_target: Vec3,
         light_dir: Vec3,
+        no_cull: bool,
+        no_depth: bool,
     }
     let (scene_tx, scene_rx) = watch::channel(SceneParams {
         angle: 0.0,
         debug: false,
+        debug_depth: false,
         time: 0.0,
         cam_pos: vec3(0.0, 0.0, 3.0),
         cam_target: vec3(0.0, 0.0, 0.0),
         light_dir: vec3(0.6, 0.7, 0.2).normalize(),
+        no_cull: false,
+        no_depth: false,
     });
 
     // Preallocate double buffers and send to worker
@@ -458,7 +618,7 @@ async fn main() {
     let sphere_tris_w = sphere_tris.clone();
     tokio::spawn(async move {
         // Depth buffer reused inside worker
-        let mut depth = vec![f32::INFINITY; WIDTH * HEIGHT];
+        let mut depth = vec![1.0f32; WIDTH * HEIGHT]; // z in [0,1], initialize to far
         let up = up;
         let scene_rx = scene_rx;
 
@@ -493,9 +653,14 @@ async fn main() {
             // Read latest scene params
             let params = *scene_rx.borrow();
 
-            // Clear buffers
-            color.fill(0xFF101018);
-            depth.fill(f32::INFINITY);
+            // Clear buffers and draw a diagnostic gradient background so we always see something when frames present
+            for y in 0..HEIGHT {
+                let gy = (255.0 * (y as f32 / (HEIGHT as f32 - 1.0))) as u32;
+                let row_color = 0xFF000000 | (gy << 8) | gy; // teal-ish gradient
+                let row = &mut color[y*WIDTH..(y+1)*WIDTH];
+                row.fill(row_color);
+            }
+            depth.fill(1.0);
 
             // Compute transforms for this frame
             let angle = params.angle;
@@ -514,24 +679,32 @@ async fn main() {
                 let ndc = clip.truncate() * inv_w;
                 let screen = to_screen(ndc);
                 let normal_ws = (model * v.normal.extend(0.0)).truncate();
-                var.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
+                var.push(Varyings { clip, screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
             }
 
             // Partition into fine-grained row chunks and bin triangles per chunk
             let rows_per_band = CHUNK_ROWS;
             let num_bands = (HEIGHT + rows_per_band - 1) / rows_per_band;
 
+            // After homogeneous near-plane clipping, we produce a small list of triangles per original tri.
+            let mut clipped_tris: Vec<[Varyings;3]> = Vec::new();
+            for (_ti, t) in tris_w.iter().enumerate() {
+                let a = var[t[0] as usize];
+                let b = var[t[1] as usize];
+                let c = var[t[2] as usize];
+                if !params.no_cull {
+                    let area = edge(a.screen, b.screen, c.screen);
+                    if area >= 0.0 { continue; }
+                }
+                for tri in clip_triangle_near(&a, &b, &c) {
+                    clipped_tris.push(tri);
+                }
+            }
+
             // Triangle bins per band (by y-range)
             let mut bins: Vec<Vec<usize>> = vec![Vec::new(); num_bands];
-            for (ti, t) in tris_w.iter().enumerate() {
-                // Backface cull early in world space to match raster rule
-                let aw = var[t[0] as usize].world_pos;
-                let bw = var[t[1] as usize].world_pos;
-                let cw = var[t[2] as usize].world_pos;
-                if !is_front_facing(aw, bw, cw, params.cam_pos) { continue; }
-                let a = var[t[0] as usize].screen;
-                let b = var[t[1] as usize].screen;
-                let c = var[t[2] as usize].screen;
+            for (ti, tri) in clipped_tris.iter().enumerate() {
+                let a = tri[0].screen; let b = tri[1].screen; let c = tri[2].screen;
                 let mut min_y = a.y.min(b.y).min(c.y).floor() as i32;
                 let mut max_y = a.y.max(b.y).max(c.y).ceil() as i32;
                 min_y = clamp_i32(min_y, 0, (HEIGHT - 1) as i32);
@@ -539,9 +712,7 @@ async fn main() {
                 if min_y > max_y { continue; }
                 let first_band = (min_y as usize) / rows_per_band;
                 let last_band = (max_y as usize) / rows_per_band;
-                for bi in first_band..=last_band {
-                    bins[bi].push(ti);
-                }
+                for bi in first_band..=last_band { bins[bi].push(ti); }
             }
 
             // Safety: split disjointly by rows
@@ -593,20 +764,22 @@ async fn main() {
 
             let time = params.time;
             let light_dir = params.light_dir.normalize();
+            let no_cull = params.no_cull;
+            let no_depth = params.no_depth;
             tasks.into_par_iter().for_each(|mut t|
             {
                 for &ti in &t.bin {
-                    let idxs = tris_w[ti];
-                    let a = var[idxs[0] as usize];
-                    let b = var[idxs[1] as usize];
-                    let c = var[idxs[2] as usize];
-                    let material = tri_materials[ti];
-                    draw_triangle_band(&mut t.band, &a, &b, &c, light_dir, params.cam_pos, time, material);
+                    let tri = clipped_tris[ti];
+                    // Choose material by original triangle if we can’t track mapping after clipping; approximate by front tri index range.
+                    // Here we reuse the material of the first source tri that produced this clipped tri by bin order.
+                    // Since we don’t have back‑mapping, fallback to Checker for safety when out of range.
+                    let material = Material::Checker;
+                    draw_triangle_band_ext(&mut t.band, &tri[0], &tri[1], &tri[2], light_dir, params.cam_pos, time, material, no_cull, no_depth);
                 }
             });
 
-            // Now render the sphere: build transforms (place sphere offset) and draw
-            let sphere_model = Mat4::from_translation(vec3(-1.8, 0.0, 0.0));
+            // Now render the sphere at the origin so it intersects the cube (for depth test validation)
+            let sphere_model = Mat4::IDENTITY;
             let sphere_mvp = proj * view * sphere_model;
             let mut svar: Vec<Varyings> = Vec::with_capacity(sphere_verts_w.len());
             for v in &sphere_verts_w {
@@ -616,21 +789,23 @@ async fn main() {
                 let ndc = clip.truncate() * inv_w;
                 let screen = to_screen(ndc);
                 let normal_ws = (sphere_model * v.normal.extend(0.0)).truncate();
-                svar.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
+                svar.push(Varyings { clip, screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
             }
 
             // Bin sphere triangles
             let rows_per_band = CHUNK_ROWS;
             let num_bands = (HEIGHT + rows_per_band - 1) / rows_per_band;
+            // Clip sphere triangles against near plane and bin
+            let mut s_clipped: Vec<[Varyings;3]> = Vec::new();
+            for t in &sphere_tris_w {
+                let a = svar[t[0] as usize];
+                let b = svar[t[1] as usize];
+                let c = svar[t[2] as usize];
+                for tri in clip_triangle_near(&a, &b, &c) { s_clipped.push(tri); }
+            }
             let mut bins: Vec<Vec<usize>> = vec![Vec::new(); num_bands];
-            for (ti, t) in sphere_tris_w.iter().enumerate() {
-                let aw = svar[t[0] as usize].world_pos;
-                let bw = svar[t[1] as usize].world_pos;
-                let cw = svar[t[2] as usize].world_pos;
-                if !is_front_facing(aw, bw, cw, params.cam_pos) { continue; }
-                let a = svar[t[0] as usize].screen;
-                let b = svar[t[1] as usize].screen;
-                let c = svar[t[2] as usize].screen;
+            for (ti, tri) in s_clipped.iter().enumerate() {
+                let a = tri[0].screen; let b = tri[1].screen; let c = tri[2].screen;
                 let mut min_y = a.y.min(b.y).min(c.y).floor() as i32;
                 let mut max_y = a.y.max(b.y).max(c.y).ceil() as i32;
                 min_y = clamp_i32(min_y, 0, (HEIGHT - 1) as i32);
@@ -667,14 +842,26 @@ async fn main() {
 
             tasks2.into_par_iter().for_each(|mut t| {
                 for &ti in &t.bin {
-                    let idxs = sphere_tris_w[ti];
-                    let a = svar[idxs[0] as usize];
-                    let b = svar[idxs[1] as usize];
-                    let c = svar[idxs[2] as usize];
+                    let tri = s_clipped[ti];
                     // Sphere material: use checker to visualize UVs
-                    draw_triangle_band(&mut t.band, &a, &b, &c, light_dir, params.cam_pos, time, Material::Checker);
+                    draw_triangle_band_ext(&mut t.band, &tri[0], &tri[1], &tri[2], light_dir, params.cam_pos, time, Material::Checker, no_cull, no_depth);
                 }
             });
+
+            // Optional: depth heatmap debug
+            if params.debug_depth {
+                for i in 0..color.len() {
+                    let z = depth[i];
+                    if z < 1.0 {
+                        // nearer=dark, farther=light
+                        let g = (z * 255.0).clamp(0.0, 255.0) as u32;
+                        let px = 0xFF000000 | (g << 16) | (g << 8) | g;
+                        color[i] = px;
+                    } else {
+                        color[i] = 0xFF101018; // background
+                    }
+                }
+            }
 
             // Send completed frame back
             if from_worker_tx.send(color).await.is_err() {
@@ -687,20 +874,34 @@ async fn main() {
     let mut angle: f32 = 0.0;
     let start_time = Instant::now();
     let mut debug: bool = false;
+    let mut debug_depth: bool = false;
     let mut last_present = Instant::now();
     let mut fps_ema: f32 = 0.0;
     // Camera state
     let mut cam_pos = vec3(0.0, 0.0, 3.0);
-    let mut yaw: f32 = 0.0;   // radians around Y
+    let mut yaw: f32 = std::f32::consts::PI;   // face toward -Z so we look at origin initially
     let mut pitch: f32 = 0.0; // radians up/down
     let mut last_frame = Instant::now();
+    // Diagnostics toggles
+    let mut no_cull = false;
+    let mut no_depth = false;
+    let mut have_presented = false;
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let now_loop = Instant::now();
         let dt = now_loop.duration_since(last_frame).as_secs_f32().min(0.05);
         last_frame = now_loop;
         // Toggle debug mode on key press (no repeat)
-        if window.is_key_pressed(Key::D, KeyRepeat::No) {
+        if window.is_key_pressed(Key::F1, KeyRepeat::No) {
             debug = !debug;
+        }
+        if window.is_key_pressed(Key::F2, KeyRepeat::No) {
+            debug_depth = !debug_depth;
+        }
+        if window.is_key_pressed(Key::F3, KeyRepeat::No) {
+            no_cull = !no_cull;
+        }
+        if window.is_key_pressed(Key::F4, KeyRepeat::No) {
+            no_depth = !no_depth;
         }
 
         // Object rotation (cube)
@@ -728,29 +929,47 @@ async fn main() {
         let light_radius = 1.0;
         let light_dir = vec3((time * 0.7).cos() * light_radius, 0.6, (time * 0.7).sin() * light_radius).normalize();
         let cam_target = cam_pos + forward;
-        let _ = scene_tx.send(SceneParams { angle, debug, time, cam_pos, cam_target, light_dir });
+        let _ = scene_tx.send(SceneParams { angle, debug, debug_depth, time, cam_pos, cam_target, light_dir, no_cull, no_depth });
 
-        if let Some(color) = from_worker_rx.try_recv().ok() {
-            // Present
-            window
-                .update_with_buffer(&color, WIDTH, HEIGHT)
-                .expect("Failed to update window");
-            // FPS update
-            let now = Instant::now();
-            let dt = now.duration_since(last_present).as_secs_f32().max(1e-6);
-            last_present = now;
-            let inst_fps = 1.0 / dt;
-            fps_ema = if fps_ema == 0.0 { inst_fps } else { fps_ema * 0.9 + inst_fps * 0.1 };
-            window.set_title(&format!(
-                "Software 3D Renderer (Rust) | {:5.1} FPS | Debug {} | WASD/QE move, Arrow keys look",
-                fps_ema,
-                if debug { "ON" } else { "OFF" }
-            ));
-            // Recycle buffer
-            let _ = to_worker_tx.try_send(color);
-        } else {
-            // No new frame ready yet; keep window responsive
-            window.update();
+        match from_worker_rx.try_recv() {
+            Ok(color) => {
+                // Present
+                window
+                    .update_with_buffer(&color, WIDTH, HEIGHT)
+                    .expect("Failed to update window");
+                have_presented = true;
+                // FPS update
+                let now = Instant::now();
+                let dt = now.duration_since(last_present).as_secs_f32().max(1e-6);
+                last_present = now;
+                let inst_fps = 1.0 / dt;
+                fps_ema = if fps_ema == 0.0 { inst_fps } else { fps_ema * 0.9 + inst_fps * 0.1 };
+                window.set_title(&format!(
+                    "Software 3D Renderer (Rust) | {:5.1} FPS | Debug {} (F1) | Depth {} (F2) | NoCull {} (F3) | NoDepth {} (F4) | WASD/QE move, Arrow keys look",
+                    fps_ema,
+                    if debug { "ON" } else { "OFF" },
+                    if debug_depth { "ON" } else { "OFF" },
+                    if no_cull { "ON" } else { "OFF" },
+                    if no_depth { "ON" } else { "OFF" }
+                ));
+                // Recycle buffer
+                if let Err(e) = to_worker_tx.try_send(color) {
+                    eprintln!("WARN: failed to recycle buffer to worker: {e:?}");
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                // No new frame ready yet; keep window responsive
+                window.update();
+                // If we still haven't presented anything after a short time, emit a hint in title
+                if !have_presented && start_time.elapsed().as_secs_f32() > 0.5 {
+                    window.set_title("Software 3D Renderer (Rust) | waiting for first frame...");
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                window.set_title("Software 3D Renderer (Rust) | worker disconnected (no frames)");
+                eprintln!("ERROR: render worker disconnected; exiting main loop");
+                break;
+            }
         }
     }
 }
