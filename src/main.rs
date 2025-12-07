@@ -258,9 +258,10 @@ fn make_uv_sphere(rings: u32, segments: u32, radius: f32) -> (Vec<Vertex>, Vec<[
             let i1 = i0 + 1;
             let i2 = i0 + stride;
             let i3 = i2 + 1;
-            // two triangles per quad, winding to face outward (right-handed camera)
-            tris.push([i0 as u32, i2 as u32, i1 as u32]);
-            tris.push([i1 as u32, i2 as u32, i3 as u32]);
+            // two triangles per quad; ensure winding matches outward-facing convention
+            // Flip from previous (which produced inward normals) to outward normals
+            tris.push([i0 as u32, i1 as u32, i2 as u32]);
+            tris.push([i1 as u32, i3 as u32, i2 as u32]);
         }
     }
     (verts, tris)
@@ -275,6 +276,14 @@ fn ndc_depth_to_zbuf(ndc_z: f32) -> f32 {
 fn edge(a: Vec3, b: Vec3, c: Vec3) -> f32 {
     // 2D edge function using top-left rule
     (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+#[inline]
+fn is_front_facing(a_wp: Vec3, b_wp: Vec3, c_wp: Vec3, cam_pos: Vec3) -> bool {
+    // World-space facing: front if triangle normal points toward camera
+    let n = (b_wp - a_wp).cross(c_wp - a_wp);
+    let to_cam = cam_pos - (a_wp + b_wp + c_wp) * (1.0 / 3.0);
+    n.dot(to_cam) > 0.0
 }
 
 #[inline]
@@ -332,9 +341,8 @@ fn blend_tint_argb(color: u32, tint: u32, t_num: u8, t_den: u8) -> u32 {
 fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyings, light_dir: Vec3, cam_pos: Vec3, time: f32, material: Material) {
     let p0 = v0.screen; let p1 = v1.screen; let p2 = v2.screen;
 
-    // Backface culling in screen space
-    let area = edge(p0, p1, p2);
-    if area >= 0.0 { return; }
+    // Backface culling in world space (robust w.r.t. projection/axis flips)
+    if !is_front_facing(v0.world_pos, v1.world_pos, v2.world_pos, cam_pos) { return; }
 
     // Bounding box clamped to band rows
     let min_x = p0.x.min(p1.x).min(p2.x).floor().max(0.0) as i32;
@@ -345,21 +353,34 @@ fn draw_triangle_band(band: &mut Band, v0: &Varyings, v1: &Varyings, v2: &Varyin
     max_y = clamp_i32(max_y, band.y0, band.y1 - 1);
     if min_y > max_y { return; }
 
+    let area = edge(p0, p1, p2);
+    if area == 0.0 { return; }
     let inv_area = 1.0 / area;
 
     for y in min_y..=max_y {
         for x in min_x..=max_x {
             let p = vec3(x as f32 + 0.5, y as f32 + 0.5, 0.0);
-            let w0 = edge(p1, p2, p) * inv_area;
-            let w1 = edge(p2, p0, p) * inv_area;
-            let w2 = edge(p0, p1, p) * inv_area;
-            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+            let mut w0 = edge(p1, p2, p) * inv_area;
+            let mut w1 = edge(p2, p0, p) * inv_area;
+            let mut w2 = edge(p0, p1, p) * inv_area;
+            // Consistent inside-test regardless of winding
+            if area > 0.0 {
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+            } else {
+                if w0 > 0.0 || w1 > 0.0 || w2 > 0.0 { continue; }
+                // make weights positive for later math
+                w0 = -w0; w1 = -w1; w2 = -w2;
+            }
 
             // Perspective-correct weights
             let invw = v0.inv_w * w0 + v1.inv_w * w1 + v2.inv_w * w2;
             let recip = 1.0 / invw;
 
-            let ndc_z = (v0.screen.z * v0.inv_w * w0 + v1.screen.z * v1.inv_w * w1 + v2.screen.z * v2.inv_w * w2) * recip;
+            // Correct perspective depth: interpolate clip-space z and w, then divide
+            // Using ndc_z directly in the 1/w scheme would introduce a 1/w^2 error.
+            let clip_z = (v0.screen.z / v0.inv_w) * w0 + (v1.screen.z / v1.inv_w) * w1 + (v2.screen.z / v2.inv_w) * w2;
+            let clip_w = (1.0 / v0.inv_w) * w0 + (1.0 / v1.inv_w) * w1 + (1.0 / v2.inv_w) * w2;
+            let ndc_z = clip_z / clip_w;
             let z = ndc_depth_to_zbuf(ndc_z);
             let idx = band_idx(band, x, y);
             if z >= band.depth[idx] { continue; }
@@ -490,7 +511,7 @@ async fn main() {
                 let world_pos = (model * v.pos.extend(1.0)).truncate();
                 let clip: Vec4 = mvp * v.pos.extend(1.0);
                 let inv_w = 1.0 / clip.w;
-                let ndc = (clip.truncate() * inv_w).clamp(vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0));
+                let ndc = clip.truncate() * inv_w;
                 let screen = to_screen(ndc);
                 let normal_ws = (model * v.normal.extend(0.0)).truncate();
                 var.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
@@ -503,11 +524,14 @@ async fn main() {
             // Triangle bins per band (by y-range)
             let mut bins: Vec<Vec<usize>> = vec![Vec::new(); num_bands];
             for (ti, t) in tris_w.iter().enumerate() {
+                // Backface cull early in world space to match raster rule
+                let aw = var[t[0] as usize].world_pos;
+                let bw = var[t[1] as usize].world_pos;
+                let cw = var[t[2] as usize].world_pos;
+                if !is_front_facing(aw, bw, cw, params.cam_pos) { continue; }
                 let a = var[t[0] as usize].screen;
                 let b = var[t[1] as usize].screen;
                 let c = var[t[2] as usize].screen;
-                // Backface cull early to avoid binning backfaces
-                if edge(a, b, c) >= 0.0 { continue; }
                 let mut min_y = a.y.min(b.y).min(c.y).floor() as i32;
                 let mut max_y = a.y.max(b.y).max(c.y).ceil() as i32;
                 min_y = clamp_i32(min_y, 0, (HEIGHT - 1) as i32);
@@ -589,7 +613,7 @@ async fn main() {
                 let world_pos = (sphere_model * v.pos.extend(1.0)).truncate();
                 let clip: Vec4 = sphere_mvp * v.pos.extend(1.0);
                 let inv_w = 1.0 / clip.w;
-                let ndc = (clip.truncate() * inv_w).clamp(vec3(-1.0, -1.0, -1.0), vec3(1.0, 1.0, 1.0));
+                let ndc = clip.truncate() * inv_w;
                 let screen = to_screen(ndc);
                 let normal_ws = (sphere_model * v.normal.extend(0.0)).truncate();
                 svar.push(Varyings { screen, inv_w, world_pos, normal: normal_ws, uv: v.uv });
@@ -600,10 +624,13 @@ async fn main() {
             let num_bands = (HEIGHT + rows_per_band - 1) / rows_per_band;
             let mut bins: Vec<Vec<usize>> = vec![Vec::new(); num_bands];
             for (ti, t) in sphere_tris_w.iter().enumerate() {
+                let aw = svar[t[0] as usize].world_pos;
+                let bw = svar[t[1] as usize].world_pos;
+                let cw = svar[t[2] as usize].world_pos;
+                if !is_front_facing(aw, bw, cw, params.cam_pos) { continue; }
                 let a = svar[t[0] as usize].screen;
                 let b = svar[t[1] as usize].screen;
                 let c = svar[t[2] as usize].screen;
-                if edge(a, b, c) >= 0.0 { continue; }
                 let mut min_y = a.y.min(b.y).min(c.y).floor() as i32;
                 let mut max_y = a.y.max(b.y).max(c.y).ceil() as i32;
                 min_y = clamp_i32(min_y, 0, (HEIGHT - 1) as i32);
